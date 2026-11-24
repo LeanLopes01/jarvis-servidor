@@ -1,0 +1,164 @@
+#!/bin/bash
+# Installs a JARVIS backend release on the home server, or rolls back. Run as root.
+#
+#   jarvis-deploy PACKAGE.tar.gz SHA256   verify, install, test, smoke-test, activate
+#   jarvis-deploy --rollback              return to the previous release
+#
+# Configuration and state live outside the releases (/etc/jarvis, /var/lib/jarvis*),
+# so switching releases never touches secrets, sessions or documents.
+set -euo pipefail
+
+BASE=/opt/jarvis
+RELEASES=$BASE/releases
+CURRENT=$BASE/current
+PREVIOUS_FILE=$BASE/previous
+MAINTENANCE=/var/lib/jarvis-control/maintenance
+KEEP_RELEASES=3
+export UV_CACHE_DIR=/var/cache/jarvis-uv
+export UV_PYTHON=/usr/bin/python3.12
+export UV_PYTHON_DOWNLOADS=never
+export PLAYWRIGHT_BROWSERS_PATH=$BASE/ms-playwright
+
+log() { echo "[jarvis-deploy] $*"; }
+die() { log "ERROR: $*"; rm -f "$MAINTENANCE"; exit 1; }
+[ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
+
+as_jarvis() {  # run a command as the agent's user, with its environment file
+    runuser -u jarvis -- env HOME=/var/lib/jarvis PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" \
+        PYTHONDONTWRITEBYTECODE=1 bash -c 'set -a; . /etc/jarvis/agent.env; set +a; exec "$@"' _ "$@"
+}
+
+switch_to() {
+    ln -sfn "releases/$1" "$BASE/current.new"
+    mv -T "$BASE/current.new" "$CURRENT"
+}
+
+install_atomically() {  # mode source target: rename keeps a running copy intact
+    install -m "$1" "$2" "$3.new" && mv -f "$3.new" "$3"
+}
+
+install_system_files() {
+    local release=$1 reload=0 unit
+    for unit in jarvis-agent.service jarvis-control.service; do
+        if ! cmp -s "$release/deploy/systemd/$unit" "/etc/systemd/system/$unit"; then
+            install_atomically 644 "$release/deploy/systemd/$unit" "/etc/systemd/system/$unit"
+            reload=1
+        fi
+    done
+    [ "$reload" = 1 ] && systemctl daemon-reload
+    install_atomically 644 "$release/deploy/polkit/50-jarvis-control.rules" \
+        /etc/polkit-1/rules.d/50-jarvis-control.rules
+    install_atomically 755 "$release/deploy/jarvis-control" /usr/local/bin/jarvis-control
+    install_atomically 750 "$release/deploy/jarvis-deploy" /usr/local/sbin/jarvis-deploy
+}
+
+wait_until_idle() {
+    touch "$MAINTENANCE"  # jarvis-control refuses new sessions while this exists
+    local state i
+    for i in $(seq 1 120); do
+        state=$(systemctl is-active jarvis-agent.service || true)
+        if [ "$state" != active ] && [ "$state" != activating ]; then
+            return 0
+        fi
+        [ "$i" = 1 ] && log "a call is in progress; waiting for it to end (up to 10 min)"
+        sleep 5
+    done
+    die "the agent is still in use; nothing was changed"
+}
+
+smoke_test() {  # real worker on this CPU: register, take a dispatch, process audio
+    local since ok=0 i
+    since=$(date "+%Y-%m-%d %H:%M:%S")
+    systemctl start jarvis-agent.service
+    for i in $(seq 1 60); do
+        [ -f /run/jarvis-agent/ready ] && break
+        sleep 1
+    done
+    if [ -f /run/jarvis-agent/ready ] &&
+        as_jarvis "$CURRENT/.venv/bin/python" "$CURRENT/deploy/smoke_session.py" 15; then
+        ok=1
+    fi
+    systemctl stop jarvis-agent.service
+    if journalctl -k --since "$since" --no-pager | grep -q -E "traps:|segfault"; then
+        log "kernel reported a crash (illegal instruction?) during the smoke test"
+        ok=0
+    fi
+    if [ "$ok" != 1 ]; then
+        journalctl -u jarvis-agent.service --since "$since" --no-pager | tail -n 30
+        return 1
+    fi
+}
+
+activate() {  # stop control, switch, smoke-test, start control; undo on failure
+    local target=$1 old
+    old=$(basename "$(readlink -f "$CURRENT" 2>/dev/null || echo none)")
+    systemctl stop jarvis-control.service 2>/dev/null || true
+    switch_to "$target"
+    install_system_files "$RELEASES/$target"
+    if ! smoke_test; then
+        if [ -d "$RELEASES/$old" ]; then
+            log "smoke test failed; returning to $old"
+            switch_to "$old"
+            install_system_files "$RELEASES/$old"
+        fi
+        systemctl enable --now jarvis-control.service
+        die "release $target was not activated"
+    fi
+    [ "$old" != "$target" ] && [ -d "$RELEASES/$old" ] && echo "$old" > "$PREVIOUS_FILE"
+    systemctl enable --now jarvis-control.service
+    systemctl restart jarvis-control.service
+    rm -f "$MAINTENANCE"
+    log "active release: $target"
+}
+
+prune() {
+    local keep_previous keep_current release
+    keep_current=$(basename "$(readlink -f "$CURRENT")")
+    keep_previous=$(cat "$PREVIOUS_FILE" 2>/dev/null || true)
+    ls -1t "$RELEASES" | tail -n +$((KEEP_RELEASES + 1)) | while read -r release; do
+        if [ "$release" != "$keep_current" ] && [ "$release" != "$keep_previous" ]; then
+            rm -rf "${RELEASES:?}/$release" && log "removed old release $release"
+        fi
+    done
+}
+
+if [ "${1:-}" = "--rollback" ]; then
+    previous=$(cat "$PREVIOUS_FILE" 2>/dev/null || true)
+    [ -n "$previous" ] && [ -d "$RELEASES/$previous" ] || die "no previous release recorded"
+    wait_until_idle
+    activate "$previous"
+    exit 0
+fi
+
+[ $# = 2 ] || { sed -n 2,8p "$0"; exit 2; }
+package=$1
+expected=$2
+echo "$expected  $package" | sha256sum -c --quiet - || die "SHA-256 mismatch for $package"
+version=$(basename "$package" .tar.gz)
+version=${version#jarvis-backend-}
+release=$RELEASES/$version
+[ -e "$release" ] && die "release $version already exists"
+
+log "installing $version"
+mkdir -p "$RELEASES" "$UV_CACHE_DIR" "$PLAYWRIGHT_BROWSERS_PATH"
+mkdir -p "$release"
+tar --no-same-owner -xzf "$package" -C "$release"
+chmod -R u=rwX,go=rX "$release"
+# Releases are read-only for the agent's user, so compile bytecode now: otherwise every
+# on-demand start recompiles the whole dependency tree (about 7 s on this CPU).
+(cd "$release" && /usr/local/bin/uv sync --locked --compile-bytecode --quiet)
+"$release/.venv/bin/python" -m compileall -q "$release/src"
+chmod -R go+rX "$release/.venv" "$release/src"
+"$release/.venv/bin/playwright" install chromium >/dev/null
+chmod -R go+rX "$PLAYWRIGHT_BROWSERS_PATH"
+
+log "running tests as the jarvis user"
+(cd "$release" && as_jarvis "$release/.venv/bin/python" -m pytest -q -p no:cacheprovider tests) ||
+    { rm -rf "$release"; die "tests failed; release removed"; }
+(cd "$release" && as_jarvis "$release/.venv/bin/python" src/agent.py download-files >/dev/null 2>&1) ||
+    die "could not download plugin files"
+
+wait_until_idle
+activate "$version"
+rm -f "$package"
+prune

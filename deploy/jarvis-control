@@ -1,0 +1,19 @@
+#!/bin/sh
+# Admin commands for jarvis-control, run as its service user. Examples:
+#   sudo jarvis-control pair --kind app        one-time code for the phone app
+#   sudo jarvis-control pair --kind desktop    one-time code for the Windows helper
+#   sudo jarvis-control devices | revoke ID | sessions
+if [ "$(id -u)" != 0 ]; then
+    echo "run with sudo: sudo jarvis-control $*" >&2
+    exit 1
+fi
+# personal-verify talks to n8n: inherit its URL and secret (not on the command line).
+if [ -r /etc/jarvis/personal.env ]; then
+    set -a
+    . /etc/jarvis/personal.env
+    set +a
+fi
+exec runuser -u jarvis-control -- env \
+    PYTHONPATH=/opt/jarvis/current/src \
+    JARVIS_CONTROL_STATE_DIR=/var/lib/jarvis-control \
+    /opt/jarvis/current/.venv/bin/python -m jarvis_control "$@"

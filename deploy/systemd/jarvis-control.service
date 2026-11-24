@@ -1,0 +1,43 @@
+# Always-on control API: starts and stops jarvis-agent on demand, issues LiveKit
+# tokens to paired phones and relays actions to the paired Windows PC.
+[Unit]
+Description=JARVIS control API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jarvis-control
+Group=jarvis-control
+# Diagnostics reports read the JARVIS units' journal (fixed queries, no shell).
+SupplementaryGroups=systemd-journal
+EnvironmentFile=/etc/jarvis/control.env
+# The same Nextcloud account as the agent: it can write only in JARVIS-Notas
+# (reports go to JARVIS-Notas/Relatorios, project history to JARVIS-Notas/DiceVTT).
+EnvironmentFile=-/etc/jarvis/nextcloud.env
+# n8n gateway for personal data (URL and shared secret); absent = feature off.
+EnvironmentFile=-/etc/jarvis/personal.env
+Environment=PYTHONPATH=/opt/jarvis/current/src
+Environment=JARVIS_CONTROL_STATE_DIR=/var/lib/jarvis-control
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+WorkingDirectory=/var/lib/jarvis-control
+ExecStart=/opt/jarvis/current/.venv/bin/python -m jarvis_control serve
+Restart=on-failure
+RestartSec=3
+StateDirectory=jarvis-control
+StateDirectoryMode=0750
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

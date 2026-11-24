@@ -1,0 +1,46 @@
+# JARVIS voice agent. Not enabled at boot: jarvis-control starts it when the app
+# opens a session and stops it after the last session ends.
+[Unit]
+Description=JARVIS voice agent (started on demand by jarvis-control)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jarvis
+Group=jarvis
+WorkingDirectory=/opt/jarvis/current
+EnvironmentFile=/etc/jarvis/agent.env
+EnvironmentFile=/etc/jarvis/nextcloud.env
+Environment=HOME=/var/lib/jarvis
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/jarvis/ms-playwright
+Environment=JARVIS_BROWSER_HEADLESS=1
+# livekit-local-inference is built with AVX2, which this CPU lacks; Gemini does turn detection.
+Environment=LIVEKIT_AGENTS_PRELOAD_LOCAL_INFERENCE=0
+Environment=JARVIS_IDLE_PROCESSES=1
+Environment=JARVIS_AGENT_HTTP_HOST=127.0.0.1
+Environment=JARVIS_READY_FILE=/run/jarvis-agent/ready
+Environment=JARVIS_CONTROL_INTERNAL_URL=http://127.0.0.1:8091
+Environment=PYTHONUNBUFFERED=1
+# Times the agent says or writes (notes, reset times) use the user's time zone.
+Environment=TZ=America/Sao_Paulo
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/jarvis/current/.venv/bin/python /opt/jarvis/current/src/agent.py start
+RuntimeDirectory=jarvis-agent
+RuntimeDirectoryMode=0755
+Restart=no
+KillMode=control-group
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/jarvis
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryMax=4G
+TasksMax=1024
